@@ -1,0 +1,21 @@
+[package]
+name = "heimdall"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9.34"
+serde_json = "1.0.145"
+anyhow = "1.0.100"
+dirs = "6.0"
+chrono = "0.4.42"
+rpassword = "7.4"
+base64 = "0.22.1"
+terminal_size = "0.4.3"
+aes-gcm = "0.11.0-rc.2"
+sha2 = "0.10.9"
+rand = "0.9.2"
+ctrlc = "3.4"

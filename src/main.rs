@@ -1,0 +1,150 @@
+use anyhow::Result;
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
+
+mod commands;
+mod config;
+mod crypto;
+mod helm;
+
+#[derive(Parser)]
+#[command(name = "heimdall")]
+#[command(about = "A CLI tool for managing Kubernetes cluster configurations", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// List all configured Kubernetes clusters
+    Ls,
+
+    /// Get kubeconfig for a specific cluster
+    Get {
+        /// Name of the cluster
+        name: String,
+
+        /// Write to file instead of stdout
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Add a new cluster configuration
+    Add {
+        /// Name of the cluster
+        name: String,
+
+        /// Hostname(s) or IP address(es) of the SSH server (comma-separated for HA)
+        #[arg(short = 'H', long)]
+        hostname: String,
+
+        /// SSH port (default: 22)
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// SSH username
+        #[arg(short, long)]
+        username: Option<String>,
+
+        /// Prompt for SSH password (secure input)
+        #[arg(long)]
+        password: bool,
+
+        /// Path to kubeconfig on remote host (default: ~/.kube/config)
+        #[arg(short = 'k', long, default_value = "~/.kube/config")]
+        kubeconfig: String,
+
+        /// Description of the cluster
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+
+    /// Remove a cluster configuration
+    Rm {
+        /// Name of the cluster to remove
+        name: String,
+    },
+
+    /// Show detailed information about a cluster
+    Info {
+        /// Name of the cluster
+        name: String,
+    },
+
+    /// Monitor cluster health (nodes, CPU, memory)
+    Watch {
+        /// Specific cluster to watch (optional, defaults to all)
+        #[arg(short, long)]
+        cluster: Option<String>,
+
+        /// Refresh interval in seconds (default: 30)
+        #[arg(short = 'i', long)]
+        interval: Option<u64>,
+    },
+
+    /// List Helm releases across all clusters
+    Releases {
+        /// Specific cluster to query (optional, defaults to all)
+        #[arg(short, long)]
+        cluster: Option<String>,
+    },
+
+    /// Sync kubeconfig(s) from remote hosts to local cache
+    Sync {
+        /// Specific cluster to sync (optional, defaults to all)
+        #[arg(short, long)]
+        cluster: Option<String>,
+    },
+
+    /// Set KUBECONFIG to use a specific cluster
+    Use {
+        /// Name of the cluster to use
+        name: String,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell type to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Ls => commands::list(),
+        Commands::Get { name, output } => commands::get(&name, output.as_deref()),
+        Commands::Add {
+            name,
+            hostname,
+            port,
+            username,
+            password,
+            kubeconfig,
+            description,
+        } => commands::add(
+            &name,
+            &hostname,
+            port,
+            username.as_deref(),
+            password,
+            &kubeconfig,
+            description.as_deref(),
+        ),
+        Commands::Rm { name } => commands::remove(&name),
+        Commands::Info { name } => commands::info(&name),
+        Commands::Watch { cluster, interval } => commands::watch(cluster.as_deref(), interval),
+        Commands::Releases { cluster } => commands::releases(cluster.as_deref()),
+        Commands::Sync { cluster } => commands::sync(cluster.as_deref()),
+        Commands::Use { name } => commands::use_cluster(&name),
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+            Ok(())
+        }
+    }
+}
