@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod crypto;
 mod helm;
+mod talos;
 
 #[derive(Parser)]
 #[command(name = "heimdall")]
@@ -35,9 +36,9 @@ enum Commands {
         /// Name of the cluster
         name: String,
 
-        /// Hostname(s) or IP address(es) of the SSH server (comma-separated for HA)
+        /// SSH host(s), or Talos endpoint(s) with --talos (comma-separated for HA)
         #[arg(short = 'H', long)]
-        hostname: String,
+        hostname: Option<String>,
 
         /// SSH port (default: 22)
         #[arg(short, long)]
@@ -52,8 +53,20 @@ enum Commands {
         password: bool,
 
         /// Path to kubeconfig on remote host (default: ~/.kube/config)
-        #[arg(short = 'k', long, default_value = "~/.kube/config")]
-        kubeconfig: String,
+        #[arg(short = 'k', long)]
+        kubeconfig: Option<String>,
+
+        /// Talos Linux cluster: fetch the kubeconfig with talosctl instead of SSH
+        #[arg(long, conflicts_with_all = ["port", "username", "password", "kubeconfig"])]
+        talos: bool,
+
+        /// Path to the talosconfig (default: $TALOSCONFIG, else ~/.talos/config)
+        #[arg(long, requires = "talos")]
+        talosconfig: Option<String>,
+
+        /// Context to use inside the talosconfig (default: its current context)
+        #[arg(long = "talos-context", requires = "talos")]
+        talos_context: Option<String>,
 
         /// Description of the cluster
         #[arg(short, long)]
@@ -124,16 +137,22 @@ fn main() -> Result<()> {
             username,
             password,
             kubeconfig,
+            talos,
+            talosconfig,
+            talos_context,
             description,
-        } => commands::add(
-            &name,
-            &hostname,
-            port,
-            username.as_deref(),
-            password,
-            &kubeconfig,
-            description.as_deref(),
-        ),
+        } => commands::add(commands::AddOptions {
+            name: &name,
+            hostname: hostname.as_deref(),
+            ssh_port: port,
+            username: username.as_deref(),
+            prompt_password: password,
+            kubeconfig_path: kubeconfig.as_deref(),
+            description: description.as_deref(),
+            talos,
+            talosconfig_path: talosconfig.as_deref(),
+            talos_context: talos_context.as_deref(),
+        }),
         Commands::Rm { name } => commands::remove(&name),
         Commands::Info { name } => commands::info(&name),
         Commands::Watch { cluster, interval } => commands::watch(cluster.as_deref(), interval),

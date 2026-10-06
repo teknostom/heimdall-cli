@@ -4,19 +4,63 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Default path to the kubeconfig on an SSH-managed host
+pub const DEFAULT_REMOTE_KUBECONFIG: &str = "~/.kube/config";
+
+/// Expand a leading `~/` to the current user's home directory
+pub fn expand_tilde(path: &str) -> Result<PathBuf> {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        let home = dirs::home_dir().context("Failed to determine home directory")?;
+        Ok(home.join(stripped))
+    } else if path.starts_with('~') {
+        Err(anyhow::anyhow!(
+            "Paths like ~user are not supported, use full path or ~/"
+        ))
+    } else {
+        Ok(PathBuf::from(path))
+    }
+}
+
+/// How a cluster's kubeconfig is obtained
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterProvider {
+    /// Copy the kubeconfig off a remote host with scp
+    #[default]
+    Ssh,
+    /// Ask a Talos Linux control plane node for one with talosctl
+    Talos,
+}
+
+impl ClusterProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClusterProvider::Ssh => "ssh",
+            ClusterProvider::Talos => "talos",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClusterConfig {
     pub name: String,
+    #[serde(default)]
+    pub provider: ClusterProvider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>, // Deprecated: kept for backward compatibility
     #[serde(default)]
-    pub hostnames: Vec<String>, // Multiple SSH endpoints for HA
+    pub hostnames: Vec<String>, // Multiple SSH/Talos endpoints for HA
     #[serde(default)]
     pub discovered_node_ips: Vec<String>, // Auto-discovered node IPs from Kubernetes API
     pub ssh_port: Option<u16>,
     pub username: Option<String>,
     pub password_encrypted: Option<String>,
-    pub kubeconfig_path: String, // Path on remote host, e.g., ~/.kube/config
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig_path: Option<String>, // Path on remote host (SSH only), e.g., ~/.kube/config
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talosconfig_path: Option<String>, // Local talosconfig, defaults to talosctl's own lookup
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talos_context: Option<String>, // Context to select inside the talosconfig
     pub description: Option<String>,
     pub added_at: String,
     pub last_synced: Option<String>, // Last time kubeconfig was synced
@@ -36,18 +80,62 @@ impl ClusterConfig {
     ) -> Self {
         Self {
             name,
+            provider: ClusterProvider::Ssh,
             hostname: None, // Deprecated field
             hostnames,
             discovered_node_ips: Vec::new(),
             ssh_port,
             username,
             password_encrypted,
-            kubeconfig_path,
+            kubeconfig_path: Some(kubeconfig_path),
+            talosconfig_path: None,
+            talos_context: None,
             description,
             added_at: chrono::Utc::now().to_rfc3339(),
             last_synced: None,
             last_working_hostname: None,
         }
+    }
+
+    /// Create a Talos cluster, reached with talosctl instead of SSH.
+    ///
+    /// `endpoints` may be empty, in which case talosctl falls back to the
+    /// endpoints defined in the talosconfig itself.
+    pub fn new_talos(
+        name: String,
+        endpoints: Vec<String>,
+        talosconfig_path: Option<String>,
+        talos_context: Option<String>,
+        description: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            provider: ClusterProvider::Talos,
+            hostname: None,
+            hostnames: endpoints,
+            discovered_node_ips: Vec::new(),
+            ssh_port: None,
+            username: None,
+            password_encrypted: None,
+            kubeconfig_path: None,
+            talosconfig_path,
+            talos_context,
+            description,
+            added_at: chrono::Utc::now().to_rfc3339(),
+            last_synced: None,
+            last_working_hostname: None,
+        }
+    }
+
+    pub fn is_talos(&self) -> bool {
+        self.provider == ClusterProvider::Talos
+    }
+
+    /// Path to the kubeconfig on the remote host (SSH clusters only)
+    pub fn remote_kubeconfig_path(&self) -> &str {
+        self.kubeconfig_path
+            .as_deref()
+            .unwrap_or(DEFAULT_REMOTE_KUBECONFIG)
     }
 
     /// Get all hostnames for this cluster (handles backward compatibility)

@@ -4,7 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::config::{ClusterConfig, Config};
+use crate::config::{
+    ClusterConfig, ClusterProvider, Config, DEFAULT_REMOTE_KUBECONFIG, expand_tilde,
+};
 use crate::helm::HelmRelease;
 
 // Global cache for master password during session
@@ -30,18 +32,28 @@ pub fn list() -> Result<()> {
     println!("Configured Kubernetes clusters:\n");
     println!("{:-<width$}", "", width = term_width);
     println!(
-        "{:<20} {:<30} {:<15} {:<10} {:<8} DESCRIPTION",
-        "NAME", "HOSTNAME", "USERNAME", "PORT", "SYNCED"
+        "{:<20} {:<7} {:<28} {:<12} {:<6} {:<7} DESCRIPTION",
+        "NAME", "TYPE", "HOSTNAME", "USERNAME", "PORT", "SYNCED"
     );
     println!("{:-<width$}", "", width = term_width);
 
     for cluster in clusters {
         let description = cluster.description.as_deref().unwrap_or("-");
-        let username = cluster.username.as_deref().unwrap_or("-");
-        let port = cluster
-            .ssh_port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "22".to_string());
+
+        // SSH credentials are meaningless for providers that do not use SSH
+        let username = if cluster.is_talos() {
+            "-"
+        } else {
+            cluster.username.as_deref().unwrap_or("-")
+        };
+        let port = if cluster.is_talos() {
+            "-".to_string()
+        } else {
+            cluster
+                .ssh_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "22".to_string())
+        };
         let synced = if cluster.has_cached_kubeconfig() {
             "✓"
         } else {
@@ -59,8 +71,14 @@ pub fn list() -> Result<()> {
         };
 
         println!(
-            "{:<20} {:<30} {:<15} {:<10} {:<8} {}",
-            cluster.name, hostname_display, username, port, synced, description
+            "{:<20} {:<7} {:<28} {:<12} {:<6} {:<7} {}",
+            cluster.name,
+            cluster.provider.as_str(),
+            hostname_display,
+            username,
+            port,
+            synced,
+            description
         );
     }
 
@@ -80,7 +98,7 @@ pub fn get(name: &str, output: Option<&str>) -> Result<()> {
         .clone();
 
     // Fetch kubeconfig via SCP
-    let (kubeconfig, working_hostname, discovered_ips) = fetch_kubeconfig_via_scp(&cluster)?;
+    let (kubeconfig, working_hostname, discovered_ips) = fetch_kubeconfig(&cluster)?;
 
     // Update last working hostname and discovered IPs if we got them
     if let Some(cluster_mut) = config.clusters.get_mut(name) {
@@ -103,16 +121,22 @@ pub fn get(name: &str, output: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn add(
-    name: &str,
-    hostname: &str,
-    ssh_port: Option<u16>,
-    username: Option<&str>,
-    prompt_password: bool,
-    kubeconfig_path: &str,
-    description: Option<&str>,
-) -> Result<()> {
+pub struct AddOptions<'a> {
+    pub name: &'a str,
+    pub hostname: Option<&'a str>,
+    pub ssh_port: Option<u16>,
+    pub username: Option<&'a str>,
+    pub prompt_password: bool,
+    pub kubeconfig_path: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub talos: bool,
+    pub talosconfig_path: Option<&'a str>,
+    pub talos_context: Option<&'a str>,
+}
+
+pub fn add(options: AddOptions<'_>) -> Result<()> {
     let mut config = Config::load()?;
+    let name = options.name;
 
     if config.get_cluster(name).is_some() {
         return Err(anyhow!(
@@ -122,42 +146,20 @@ pub fn add(
         ));
     }
 
-    let password_encrypted = if prompt_password {
-        let ssh_password = rpassword::prompt_password("Enter SSH password: ")
-            .context("Failed to read SSH password")?;
-
-        let master_password =
-            rpassword::prompt_password("Enter master password (for encryption): ")
-                .context("Failed to read master password")?;
-
-        let encrypted = crate::crypto::encrypt_password(&ssh_password, &master_password)
-            .context("Failed to encrypt password")?;
-
-        Some(encrypted)
-    } else {
-        None
-    };
-
     // Parse hostnames - support comma-separated list
-    let hostnames: Vec<String> = hostname
+    let hostnames: Vec<String> = options
+        .hostname
+        .unwrap_or_default()
         .split(',')
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
         .collect();
 
-    if hostnames.is_empty() {
-        return Err(anyhow!("At least one hostname must be provided"));
-    }
-
-    let cluster = ClusterConfig::new(
-        name.to_string(),
-        hostnames.clone(),
-        ssh_port,
-        username.map(String::from),
-        password_encrypted,
-        kubeconfig_path.to_string(),
-        description.map(String::from),
-    );
+    let cluster = if options.talos {
+        add_talos_cluster(&options, hostnames.clone())?
+    } else {
+        add_ssh_cluster(&options, hostnames.clone())?
+    };
 
     config.add_cluster(cluster);
     config.save()?;
@@ -174,6 +176,82 @@ pub fn add(
     }
 
     Ok(())
+}
+
+fn add_ssh_cluster(options: &AddOptions<'_>, hostnames: Vec<String>) -> Result<ClusterConfig> {
+    if hostnames.is_empty() {
+        return Err(anyhow!("At least one hostname must be provided"));
+    }
+
+    let password_encrypted = if options.prompt_password {
+        let ssh_password = rpassword::prompt_password("Enter SSH password: ")
+            .context("Failed to read SSH password")?;
+
+        let master_password =
+            rpassword::prompt_password("Enter master password (for encryption): ")
+                .context("Failed to read master password")?;
+
+        let encrypted = crate::crypto::encrypt_password(&ssh_password, &master_password)
+            .context("Failed to encrypt password")?;
+
+        Some(encrypted)
+    } else {
+        None
+    };
+
+    Ok(ClusterConfig::new(
+        options.name.to_string(),
+        hostnames,
+        options.ssh_port,
+        options.username.map(String::from),
+        password_encrypted,
+        options
+            .kubeconfig_path
+            .unwrap_or(DEFAULT_REMOTE_KUBECONFIG)
+            .to_string(),
+        options.description.map(String::from),
+    ))
+}
+
+/// Talos nodes have no SSH: the kubeconfig comes from talosctl, authenticated by
+/// the client certificate in the talosconfig, so there is no credential to store.
+fn add_talos_cluster(options: &AddOptions<'_>, endpoints: Vec<String>) -> Result<ClusterConfig> {
+    warn_about_talos_prerequisites(options, &endpoints);
+
+    Ok(ClusterConfig::new_talos(
+        options.name.to_string(),
+        endpoints,
+        options.talosconfig_path.map(String::from),
+        options.talos_context.map(String::from),
+        options.description.map(String::from),
+    ))
+}
+
+/// Point out a setup that will not work later, without refusing the add - the
+/// cluster may simply not be reachable from here yet.
+fn warn_about_talos_prerequisites(options: &AddOptions<'_>, endpoints: &[String]) {
+    if Command::new("talosctl")
+        .arg("version")
+        .arg("--client")
+        .output()
+        .is_err()
+    {
+        println!("Warning: talosctl was not found in PATH. Install it to use this cluster.");
+    }
+
+    if let Some(path) = options.talosconfig_path {
+        match expand_tilde(path) {
+            Ok(expanded) if !expanded.exists() => {
+                println!("Warning: talosconfig '{}' does not exist yet.", path);
+            }
+            Err(e) => println!("Warning: talosconfig path '{}': {}", path, e),
+            _ => {}
+        }
+    }
+
+    if endpoints.is_empty() {
+        println!("No endpoints given: falling back to the ones in the talosconfig.");
+    }
 }
 
 pub fn remove(name: &str) -> Result<()> {
@@ -198,13 +276,21 @@ pub fn info(name: &str) -> Result<()> {
 
     let hostnames = cluster.get_hostnames();
 
+    let endpoint_label = if cluster.is_talos() {
+        "Endpoint"
+    } else {
+        "Hostname"
+    };
+
     println!("Cluster Information:");
     println!("{:-<60}", "");
     println!("Name:           {}", cluster.name);
+    println!("Type:           {}", cluster.provider.as_str());
 
     if hostnames.len() > 1 {
         println!(
-            "Hostnames:      {} (HA: {} endpoints)",
+            "{:<16}{} (HA: {} endpoints)",
+            format!("{}s:", endpoint_label),
             hostnames.join(", "),
             hostnames.len()
         );
@@ -212,7 +298,9 @@ pub fn info(name: &str) -> Result<()> {
             println!("Last Working:   {}", last_working);
         }
     } else if !hostnames.is_empty() {
-        println!("Hostname:       {}", hostnames[0]);
+        println!("{:<16}{}", format!("{}:", endpoint_label), hostnames[0]);
+    } else if cluster.is_talos() {
+        println!("Endpoints:      (from talosconfig)");
     }
 
     // Show discovered node IPs if any
@@ -224,20 +312,32 @@ pub fn info(name: &str) -> Result<()> {
         );
     }
 
-    println!("SSH Port:       {}", cluster.ssh_port.unwrap_or(22));
-    println!(
-        "SSH Username:   {}",
-        cluster.username.as_deref().unwrap_or("-")
-    );
-    println!(
-        "SSH Password:   {}",
-        if cluster.password_encrypted.is_some() {
-            "****** (encrypted)"
-        } else {
-            "Not set"
-        }
-    );
-    println!("Kubeconfig:     {}", cluster.kubeconfig_path);
+    if cluster.is_talos() {
+        println!(
+            "Talosconfig:    {}",
+            cluster.talosconfig_path.as_deref().unwrap_or("(default)")
+        );
+        println!(
+            "Talos Context:  {}",
+            cluster.talos_context.as_deref().unwrap_or("(current)")
+        );
+    } else {
+        println!("SSH Port:       {}", cluster.ssh_port.unwrap_or(22));
+        println!(
+            "SSH Username:   {}",
+            cluster.username.as_deref().unwrap_or("-")
+        );
+        println!(
+            "SSH Password:   {}",
+            if cluster.password_encrypted.is_some() {
+                "****** (encrypted)"
+            } else {
+                "Not set"
+            }
+        );
+        println!("Kubeconfig:     {}", cluster.remote_kubeconfig_path());
+    }
+
     println!(
         "Description:    {}",
         cluster.description.as_deref().unwrap_or("-")
@@ -245,7 +345,60 @@ pub fn info(name: &str) -> Result<()> {
     println!("Added at:       {}", cluster.added_at);
     println!("{:-<60}", "");
 
+    if cluster.is_talos() {
+        display_talos_nodes(cluster);
+    }
+
     Ok(())
+}
+
+/// Show what the Talos machine API reports about each node. Best-effort: an
+/// unreachable cluster just means no section, since `info` is offline-usable.
+fn display_talos_nodes(cluster: &ClusterConfig) {
+    let versions = crate::talos::node_versions(cluster).unwrap_or_default();
+    let statuses = crate::talos::machine_status(cluster).unwrap_or_default();
+
+    if versions.is_empty() && statuses.is_empty() {
+        return;
+    }
+
+    println!("\nTalos Nodes:");
+    println!("{:-<60}", "");
+    println!(
+        "{:<20} {:<12} {:<12} {:<10}",
+        "NODE", "VERSION", "STAGE", "READY"
+    );
+
+    // Nodes may report a version, a status, or both
+    let mut nodes: Vec<&str> = versions.iter().map(|v| v.node.as_str()).collect();
+    for status in &statuses {
+        if !nodes.contains(&status.node.as_str()) {
+            nodes.push(&status.node);
+        }
+    }
+
+    for node in nodes {
+        let version = versions
+            .iter()
+            .find(|v| v.node == node)
+            .map(|v| v.version.as_str())
+            .unwrap_or("-");
+        let status = statuses.iter().find(|s| s.node == node);
+
+        println!(
+            "{:<20} {:<12} {:<12} {:<10}",
+            node,
+            version,
+            status.map(|s| s.stage.as_str()).unwrap_or("-"),
+            match status {
+                Some(s) if s.ready => "✓",
+                Some(_) => "✗",
+                None => "-",
+            }
+        );
+    }
+
+    println!("{:-<60}", "");
 }
 
 pub fn releases(cluster_filter: Option<&str>) -> Result<()> {
@@ -455,6 +608,7 @@ struct ClusterHealthData {
     health: Option<ClusterHealth>,
     error: Option<String>,
     connected_endpoint: Option<String>,
+    talos_version: Option<String>,
 }
 
 fn watch_loop(
@@ -505,18 +659,30 @@ fn fetch_all_cluster_health(clusters: &[&ClusterConfig]) -> Vec<ClusterHealthDat
                     let _ = fs::remove_file(kubeconfig_path);
                 }
 
+                // The kubeconfig fetch already proved the machine API answers,
+                // so this extra call cannot hang on an unreachable cluster
+                let talos_version = if cluster.is_talos() {
+                    crate::talos::node_versions(cluster)
+                        .ok()
+                        .and_then(|versions| crate::talos::summarize_versions(&versions))
+                } else {
+                    None
+                };
+
                 match health_result {
                     Ok(health) => ClusterHealthData {
                         name: cluster.name.clone(),
                         health: Some(health),
                         error: None,
                         connected_endpoint: working_hostname,
+                        talos_version,
                     },
                     Err(e) => ClusterHealthData {
                         name: cluster.name.clone(),
                         health: None,
                         error: Some(e.to_string()),
                         connected_endpoint: working_hostname,
+                        talos_version,
                     },
                 }
             }
@@ -525,6 +691,7 @@ fn fetch_all_cluster_health(clusters: &[&ClusterConfig]) -> Vec<ClusterHealthDat
                 health: None,
                 error: Some(e.to_string()),
                 connected_endpoint: None,
+                talos_version: None,
             },
         };
 
@@ -533,6 +700,9 @@ fn fetch_all_cluster_health(clusters: &[&ClusterConfig]) -> Vec<ClusterHealthDat
 
     health_data
 }
+
+/// CLUSTER(20) NODES(8) CPU(8) MEMORY(8) STATUS(16) ENDPOINT(15) TALOS(10), single-space separated
+const ROW_CONTENT_WIDTH: usize = 20 + 1 + 8 + 1 + 8 + 1 + 8 + 1 + 16 + 1 + 15 + 1 + 10;
 
 fn display_cluster_health_data(health_data: &[ClusterHealthData]) -> Result<usize> {
     use std::io::Write;
@@ -588,17 +758,16 @@ fn display_cluster_health_data(health_data: &[ClusterHealthData]) -> Result<usiz
     line_count += 1;
 
     // Header line with bright text
-    // Column widths: CLUSTER(20) NODES(8) CPU(8) MEMORY(8) STATUS(16) ENDPOINT(15)
+    // Column widths: CLUSTER(20) NODES(8) CPU(8) MEMORY(8) STATUS(16) ENDPOINT(15) TALOS(10)
     print!("{}{}{}", bg_color, bold, muted_text);
     print!("{}", left_padding);
     print!(
-        "{:<20} {:<8} {:<8} {:<8} {:<16} {:<15}",
-        "CLUSTER", "NODES", "CPU", "MEMORY", "STATUS", "ENDPOINT"
+        "{:<20} {:<8} {:<8} {:<8} {:<16} {:<15} {:<10}",
+        "CLUSTER", "NODES", "CPU", "MEMORY", "STATUS", "ENDPOINT", "TALOS"
     );
-    let header_content_width = 20 + 1 + 8 + 1 + 8 + 1 + 8 + 1 + 16 + 1 + 15; // 80
     print!(
         "{}",
-        " ".repeat(term_width.saturating_sub(header_content_width + total_padding))
+        " ".repeat(term_width.saturating_sub(ROW_CONTENT_WIDTH + total_padding))
     );
     print!("{}", right_padding);
     println!("{}", reset);
@@ -664,12 +833,16 @@ fn display_cluster_health_data(health_data: &[ClusterHealthData]) -> Result<usiz
                 // Endpoint (muted) - 15 chars
                 let endpoint = data.connected_endpoint.as_deref().unwrap_or("-");
                 print!("{}{:<15}", muted_text, endpoint);
+                print!(" ");
+
+                // Talos version (muted) - 10 chars, blank for other providers
+                let talos_version = data.talos_version.as_deref().unwrap_or("-");
+                print!("{}{:<10}", muted_text, talos_version);
 
                 // Fill rest of line with background
-                let content_width = 20 + 1 + 8 + 1 + 8 + 1 + 8 + 1 + 16 + 1 + 15; // 80
                 print!(
                     "{}",
-                    " ".repeat(term_width.saturating_sub(content_width + total_padding))
+                    " ".repeat(term_width.saturating_sub(ROW_CONTENT_WIDTH + total_padding))
                 );
                 print!("{}", right_padding);
                 println!("{}", reset);
@@ -690,10 +863,11 @@ fn display_cluster_health_data(health_data: &[ClusterHealthData]) -> Result<usiz
                 print!(" ");
                 let endpoint = data.connected_endpoint.as_deref().unwrap_or("-");
                 print!("{}{:<15}", muted_text, endpoint);
-                let content_width = 20 + 1 + 8 + 1 + 8 + 1 + 8 + 1 + 16 + 1 + 15; // 80
+                print!(" ");
+                print!("{}{:<10}", muted_text, "-");
                 print!(
                     "{}",
-                    " ".repeat(term_width.saturating_sub(content_width + total_padding))
+                    " ".repeat(term_width.saturating_sub(ROW_CONTENT_WIDTH + total_padding))
                 );
                 print!("{}", right_padding);
                 println!("{}", reset);
@@ -921,7 +1095,7 @@ fn try_fetch_from_hostname(
     ssh_password: Option<&str>,
     max_retries: u32,
 ) -> Result<String> {
-    let remote_path = &cluster.kubeconfig_path;
+    let remote_path = cluster.remote_kubeconfig_path();
     let temp_dir = std::env::temp_dir();
     let temp_kubeconfig = temp_dir.join(format!("heimdall-{}-kubeconfig", cluster.name));
 
@@ -974,24 +1148,13 @@ fn try_fetch_from_hostname(
         match output {
             Ok(output) if output.status.success() => {
                 // Success! Read the fetched kubeconfig
-                let mut kubeconfig_content = fs::read_to_string(&temp_kubeconfig)
+                let kubeconfig_content = fs::read_to_string(&temp_kubeconfig)
                     .context("Failed to read fetched kubeconfig")?;
 
                 // Clean up
                 let _ = fs::remove_file(temp_kubeconfig);
 
-                // Replace localhost addresses with the actual hostname for remote hosts
-                let is_localhost =
-                    hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1";
-
-                if !is_localhost {
-                    kubeconfig_content = kubeconfig_content
-                        .replace("https://127.0.0.1:", &format!("https://{}:", hostname))
-                        .replace("https://localhost:", &format!("https://{}:", hostname))
-                        .replace("https://::1:", &format!("https://{}:", hostname));
-                }
-
-                return Ok(kubeconfig_content);
+                return Ok(rewrite_localhost_server(kubeconfig_content, hostname));
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1005,6 +1168,117 @@ fn try_fetch_from_hostname(
 
     Err(last_error
         .unwrap_or_else(|| anyhow!("Failed to fetch kubeconfig after {} retries", max_retries)))
+}
+
+/// Point a kubeconfig at `host` when its API server address is a loopback one,
+/// which is what we get from a control plane that only knows itself as localhost
+fn rewrite_localhost_server(kubeconfig_content: String, host: &str) -> String {
+    if is_localhost(host) {
+        return kubeconfig_content;
+    }
+
+    kubeconfig_content
+        .replace("https://127.0.0.1:", &format!("https://{}:", host))
+        .replace("https://localhost:", &format!("https://{}:", host))
+        .replace("https://::1:", &format!("https://{}:", host))
+}
+
+fn is_localhost(host: &str) -> bool {
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+/// How long to wait when checking whether an API server address answers
+const REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Talos advertises the control plane endpoint the cluster was built with, which
+/// is often on a network the client cannot reach. When that address does not
+/// answer, swap in a Talos endpoint that does - they front the same control
+/// plane. A server that answers is left alone, so a working kubeconfig is never
+/// rewritten into a broken one.
+fn rewrite_unreachable_server(kubeconfig_content: String, endpoints: &[String]) -> String {
+    if endpoints.is_empty() {
+        return kubeconfig_content;
+    }
+
+    let Some(server) = kubeconfig_server(&kubeconfig_content) else {
+        return kubeconfig_content;
+    };
+    let Some((host, port)) = split_host_port(&server) else {
+        return kubeconfig_content;
+    };
+
+    if is_reachable(host, port) {
+        return kubeconfig_content;
+    }
+
+    for endpoint in endpoints {
+        let candidate = endpoint_host(endpoint);
+
+        if candidate != host && is_reachable(candidate, port) {
+            return kubeconfig_content.replace(
+                &format!("://{}:{}", host, port),
+                &format!("://{}:{}", candidate, port),
+            );
+        }
+    }
+
+    kubeconfig_content
+}
+
+/// The API server URL of the first cluster entry in a kubeconfig
+fn kubeconfig_server(kubeconfig_content: &str) -> Option<String> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(kubeconfig_content).ok()?;
+
+    parsed
+        .get("clusters")?
+        .as_sequence()?
+        .first()?
+        .get("cluster")?
+        .get("server")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Split `https://host:port` into its host and port, IPv6 literals included
+fn split_host_port(server: &str) -> Option<(&str, u16)> {
+    let authority = server.split_once("://").map(|(_, rest)| rest)?;
+    let authority = authority.split('/').next()?;
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        (host, rest.strip_prefix(':')?)
+    } else {
+        authority.rsplit_once(':')?
+    };
+
+    Some((host, port.parse().ok()?))
+}
+
+/// Strip the Talos API port off an endpoint, leaving the bare host
+fn endpoint_host(endpoint: &str) -> &str {
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .map(|(host, _)| host)
+            .unwrap_or(endpoint);
+    }
+
+    match endpoint.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host,
+        _ => endpoint,
+    }
+}
+
+fn is_reachable(host: &str, port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+
+    addresses
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, REACHABILITY_TIMEOUT).is_ok())
 }
 
 /// Discover node IPs from a kubeconfig file by running kubectl get nodes
@@ -1056,6 +1330,42 @@ fn discover_node_ips(kubeconfig_content: &str) -> Vec<String> {
     node_ips
 }
 
+/// Fetch a cluster's kubeconfig, returning it along with the endpoint that
+/// served it (when known) and the node IPs discovered through it
+fn fetch_kubeconfig(cluster: &ClusterConfig) -> Result<(String, Option<String>, Vec<String>)> {
+    match cluster.provider {
+        ClusterProvider::Ssh => fetch_kubeconfig_via_scp(cluster),
+        ClusterProvider::Talos => fetch_kubeconfig_via_talosctl(cluster),
+    }
+}
+
+/// Fetch a Talos cluster's kubeconfig with talosctl.
+///
+/// talosctl picks the endpoint itself, but it fetches a kubeconfig from exactly
+/// one node, so the node it used is what we report back as the live one.
+fn fetch_kubeconfig_via_talosctl(
+    cluster: &ClusterConfig,
+) -> Result<(String, Option<String>, Vec<String>)> {
+    let context = crate::talos::context_info(cluster);
+    let (kubeconfig_content, serving_node) = crate::talos::kubeconfig(cluster, &context.nodes)?;
+
+    let kubeconfig_content = match serving_node {
+        Some(ref node) => rewrite_localhost_server(kubeconfig_content, node),
+        None => kubeconfig_content,
+    };
+
+    // Explicitly configured endpoints win over the talosconfig's own
+    let endpoints = match cluster.get_hostnames() {
+        configured if !configured.is_empty() => configured,
+        _ => context.endpoints,
+    };
+    let kubeconfig_content = rewrite_unreachable_server(kubeconfig_content, &endpoints);
+
+    let discovered_ips = discover_node_ips(&kubeconfig_content);
+
+    Ok((kubeconfig_content, serving_node, discovered_ips))
+}
+
 fn fetch_kubeconfig_via_scp(
     cluster: &ClusterConfig,
 ) -> Result<(String, Option<String>, Vec<String>)> {
@@ -1066,26 +1376,9 @@ fn fetch_kubeconfig_via_scp(
     }
 
     // Check if this is localhost - use direct file copy instead of SCP
-    let first_hostname = &hostnames[0];
-    let is_localhost =
-        first_hostname == "localhost" || first_hostname == "127.0.0.1" || first_hostname == "::1";
-
-    if is_localhost {
+    if is_localhost(&hostnames[0]) {
         // For localhost, just read the file directly
-        let remote_path = &cluster.kubeconfig_path;
-
-        // Expand ~ to home directory if present
-        let expanded_path = if let Some(stripped) = remote_path.strip_prefix("~/") {
-            let home =
-                dirs::home_dir().ok_or_else(|| anyhow!("Failed to determine home directory"))?;
-            home.join(stripped)
-        } else if remote_path.starts_with('~') {
-            return Err(anyhow!(
-                "Paths like ~user are not supported, use full path or ~/"
-            ));
-        } else {
-            PathBuf::from(remote_path)
-        };
+        let expanded_path = expand_tilde(cluster.remote_kubeconfig_path())?;
 
         let kubeconfig_content = fs::read_to_string(&expanded_path).context(format!(
             "Failed to read kubeconfig from {}",
@@ -1152,7 +1445,7 @@ fn get_kubeconfig_path(
     cluster: &ClusterConfig,
 ) -> Result<(PathBuf, bool, Option<String>, Vec<String>)> {
     // Always fetch fresh to ensure failover works and we get latest config
-    let (kubeconfig_content, working_hostname, discovered_ips) = fetch_kubeconfig_via_scp(cluster)?;
+    let (kubeconfig_content, working_hostname, discovered_ips) = fetch_kubeconfig(cluster)?;
 
     // Write to temp file
     let temp_dir = std::env::temp_dir();
@@ -1197,7 +1490,7 @@ pub fn sync(cluster_filter: Option<&str>) -> Result<()> {
         print!("Syncing {} ... ", cluster.name);
 
         // Fetch kubeconfig via SCP
-        match fetch_kubeconfig_via_scp(&cluster) {
+        match fetch_kubeconfig(&cluster) {
             Ok((kubeconfig_content, working_hostname, discovered_ips)) => {
                 // Ensure the heimdall directory exists
                 let local_path = cluster.local_kubeconfig_path()?;
@@ -1262,7 +1555,7 @@ pub fn use_cluster(name: &str) -> Result<()> {
 
         // Fetch kubeconfig and save to local cache
         let cluster_clone = cluster.clone();
-        match fetch_kubeconfig_via_scp(&cluster_clone) {
+        match fetch_kubeconfig(&cluster_clone) {
             Ok((kubeconfig_content, working_hostname, discovered_ips)) => {
                 // Ensure the heimdall directory exists
                 if let Some(parent) = local_path.parent() {
@@ -1388,4 +1681,63 @@ fn merge_kubeconfig_section(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_server_urls_into_host_and_port() {
+        assert_eq!(
+            split_host_port("https://172.20.42.21:6443"),
+            Some(("172.20.42.21", 6443))
+        );
+        assert_eq!(
+            split_host_port("https://api.example.com:6443/"),
+            Some(("api.example.com", 6443))
+        );
+        assert_eq!(split_host_port("https://[::1]:6443"), Some(("::1", 6443)));
+        assert_eq!(split_host_port("https://no-port"), None);
+    }
+
+    #[test]
+    fn strips_the_talos_port_from_endpoints() {
+        assert_eq!(endpoint_host("172.21.32.85"), "172.21.32.85");
+        assert_eq!(endpoint_host("172.21.32.85:50000"), "172.21.32.85");
+        assert_eq!(endpoint_host("[fd00::1]:50000"), "fd00::1");
+        assert_eq!(endpoint_host("fd00::1"), "fd00::1");
+    }
+
+    #[test]
+    fn reads_the_server_from_a_kubeconfig() {
+        let kubeconfig = "apiVersion: v1\nkind: Config\nclusters:\n- name: talos-dev\n  cluster:\n    server: https://172.20.42.21:6443\n";
+
+        assert_eq!(
+            kubeconfig_server(kubeconfig).as_deref(),
+            Some("https://172.20.42.21:6443")
+        );
+        assert_eq!(kubeconfig_server("clusters: []\n"), None);
+    }
+
+    #[test]
+    fn leaves_the_kubeconfig_alone_when_there_are_no_endpoints() {
+        let kubeconfig =
+            "clusters:\n- cluster:\n    server: https://172.20.42.21:6443\n".to_string();
+
+        assert_eq!(
+            rewrite_unreachable_server(kubeconfig.clone(), &[]),
+            kubeconfig
+        );
+    }
+
+    #[test]
+    fn points_a_loopback_server_at_the_host_it_came_from() {
+        let kubeconfig = "    server: https://127.0.0.1:6443\n".to_string();
+
+        assert_eq!(
+            rewrite_localhost_server(kubeconfig, "10.0.0.5"),
+            "    server: https://10.0.0.5:6443\n"
+        );
+    }
 }

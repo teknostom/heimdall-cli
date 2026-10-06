@@ -4,13 +4,14 @@ A CLI tool for managing Kubernetes cluster configurations across multiple remote
 
 ## Overview
 
-Heimdall simplifies the management of multiple Kubernetes clusters by storing cluster connection details and securely fetching kubeconfig files from remote hosts via SSH. It provides a centralized way to access, monitor, and manage your Kubernetes clusters.
+Heimdall simplifies the management of multiple Kubernetes clusters by storing cluster connection details and securely fetching kubeconfig files from remote hosts. It provides a centralized way to access, monitor, and manage your Kubernetes clusters.
 
 ## Features
 
 - **Cluster Management**: Add, remove, and list Kubernetes cluster configurations
 - **Secure Storage**: Encrypted storage of SSH credentials using AES-GCM
 - **Remote Access**: Fetch kubeconfig files from remote hosts via SSH
+- **Talos Linux**: Fetch kubeconfigs with `talosctl`, for clusters with no SSH
 - **Cluster Monitoring**: Watch cluster health metrics (nodes, CPU, memory)
 - **Helm Integration**: List Helm releases across all clusters
 - **Multi-Cluster Support**: Manage multiple clusters from a single interface
@@ -44,6 +45,40 @@ heimdall add my-cluster \
   --password \
   --description "Production cluster"
 ```
+
+### Add a Talos Linux Cluster
+
+Talos nodes have no SSH, so the kubeconfig is fetched with `talosctl` and
+authenticated by the client certificate in your talosconfig. Requires `talosctl`
+in `PATH` and a working talosconfig; the SSH options do not apply.
+
+```bash
+# Endpoints and nodes taken from the talosconfig
+heimdall add talos-dev --talos --description "Talos dev cluster"
+
+# Explicit Talos API endpoints (comma-separated for HA)
+heimdall add talos-prod --talos \
+  --hostname 10.0.0.11,10.0.0.12,10.0.0.13 \
+  --description "Talos production"
+
+# A talosconfig somewhere other than $TALOSCONFIG / ~/.talos/config
+heimdall add talos-dev --talos \
+  --talosconfig ~/work/talos-dev.yaml \
+  --talos-context talos-dev
+```
+
+`--hostname` sets the Talos API **endpoints** only. The **nodes** always come
+from the talosconfig context, because `talosctl kubeconfig` targets exactly one
+node - heimdall tries each of the context's nodes until one answers.
+
+Talos hands out a kubeconfig pointing at the control plane endpoint the cluster
+was built with, which is often on a network you cannot reach. If that address
+does not answer, heimdall substitutes a Talos endpoint that does - they front
+the same control plane. A server that answers is never rewritten.
+
+Once added, a Talos cluster behaves like any other: `get`, `sync`, `use`,
+`watch` and `releases` all work against it. `info` and `watch` additionally show
+the Talos version reported by each node.
 
 ### Get Kubeconfig
 
